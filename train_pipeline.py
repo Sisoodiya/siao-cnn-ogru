@@ -215,15 +215,21 @@ def run_complete_pipeline(
     from src.siao_cnn_ogru.data.window_processor import SlidingWindowProcessor
     
     with console.status("[bold green]Processing windows...[/bold green]", spinner="dots"):
-        window_proc = SlidingWindowProcessor(
-            window_size=window_size,
-            stride=stride,
-            padding='zero'
-        )
-        
-        X_windows, y_windows, window_group_ids = window_proc.transform(
-            X_raw, y_raw, return_sample_indices=True
-        )
+        if X_raw.shape[1] == window_size:
+            # Fast path: each sample already matches the target window length.
+            # This avoids unnecessary sliding-window expansion and keeps one group per source sample.
+            X_windows = X_raw.astype(np.float32)
+            y_windows = y_raw.astype(np.int64)
+            window_group_ids = np.arange(len(y_raw), dtype=np.int64)
+        else:
+            window_proc = SlidingWindowProcessor(
+                window_size=window_size,
+                stride=stride,
+                padding='zero'
+            )
+            X_windows, y_windows, window_group_ids = window_proc.transform(
+                X_raw, y_raw, return_sample_indices=True
+            )
     
     console.print(f" [bold]Windowed data:[/bold] X={X_windows.shape}, y={y_windows.shape}")
     console.print(
