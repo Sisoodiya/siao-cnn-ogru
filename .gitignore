@@ -1,0 +1,21 @@
+# Keep dataset out of version control for this research workspace
+data/Operation_csv_data
+
+# Runtime / experiment artifacts
+results/*
+!results/.gitkeep
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Notebook and editor artifacts
+.ipynb_checkpoints/
+.DS_Store
+.vscode/
+.idea/
