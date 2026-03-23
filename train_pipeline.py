@@ -567,7 +567,7 @@ def quick_start():
         wks_pop_size=15,
         wks_max_iter=30,
         siao_pop_size=25,  # Optuna optimized
-        siao_max_iter=80,  # Increased from 40 for stronger SIAO search
+        siao_max_iter=40,  # Optuna optimized
         bp_epochs=100,
         bp_lr=0.00157,  # Optuna optimized
         fc_dropout=0.164,  # Optuna optimized
