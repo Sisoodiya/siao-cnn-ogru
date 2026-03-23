@@ -209,9 +209,37 @@ class NPPADDataPipeline:
         logger.info("Found %d unique classes", unique_classes)
         logger.info("Feature count: %d", X.shape[2])
 
+    def _dataset_fingerprint(self) -> str:
+        """Create a lightweight fingerprint of active CSV files for cache safety."""
+        file_entries = []
+        for class_code in self.active_class_codes:
+            class_dir = self.data_dir / class_code
+            if not class_dir.exists():
+                file_entries.append(f"{class_code}:missing")
+                continue
+
+            csv_files = sorted(class_dir.glob("*.csv"))
+            for csv_file in csv_files:
+                stat = csv_file.stat()
+                rel_name = str(csv_file.relative_to(self.data_dir))
+                file_entries.append(f"{rel_name}:{stat.st_size}:{int(stat.st_mtime_ns)}")
+
+        digest_input = "\n".join(file_entries).encode("utf-8")
+        return hashlib.md5(digest_input).hexdigest()[:12]
+
     def _cache_suffix(self) -> str:
-        key = "|".join(self.active_class_codes)
-        return hashlib.md5(key.encode("utf-8")).hexdigest()[:10]
+        dataset_fp = self._dataset_fingerprint()
+        key_parts = [
+            "|".join(self.active_class_codes),
+            f"t={self.max_timesteps}",
+            f"norm={self.normalization}",
+            f"missing={self.handle_missing}",
+            f"time_col={self.time_column}",
+            f"outlier_w={self.outlier_window}",
+            f"data_fp={dataset_fp}",
+        ]
+        key = "||".join(key_parts)
+        return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
 
     def run(
         self,
@@ -225,7 +253,7 @@ class NPPADDataPipeline:
         y_cache = cache_path / f"y_nppad_{suffix}.npy"
 
         if use_cache and X_cache.exists() and y_cache.exists():
-            logger.info("Loading cached data for class set %s", self.active_class_codes)
+            logger.info("Loading cached data for class set %s (cache suffix: %s)", self.active_class_codes, suffix)
             X = np.load(X_cache)
             y = np.load(y_cache)
             logger.info("Loaded from cache - X: %s, y: %s", X.shape, y.shape)

@@ -8,7 +8,7 @@ Author: Time-Series Processing Agent
 """
 
 import logging
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Union
 import numpy as np
 
 logging.basicConfig(
@@ -140,8 +140,9 @@ class SlidingWindowProcessor:
     def transform(
         self,
         X: np.ndarray,
-        y: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        y: np.ndarray,
+        return_sample_indices: bool = False
+    ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
         Apply sliding window transformation to the dataset.
         
@@ -154,6 +155,7 @@ class SlidingWindowProcessor:
         Returns:
             X_windows: Windowed data [total_windows, window_size, features]
             y_windows: Propagated labels [total_windows]
+            sample_indices: Optional source sample index per window [total_windows]
         """
         self._validate_input(X, y)
         
@@ -164,6 +166,7 @@ class SlidingWindowProcessor:
         
         all_windows = []
         all_labels = []
+        all_sample_indices = []
         windows_per_sample = []
         
         for i in range(num_samples):
@@ -176,6 +179,7 @@ class SlidingWindowProcessor:
             if windows.shape[0] > 0:
                 all_windows.append(windows)
                 all_labels.extend([label] * windows.shape[0])
+                all_sample_indices.extend([i] * windows.shape[0])
                 windows_per_sample.append(windows.shape[0])
             else:
                 logger.warning(f"Sample {i} produced no windows (label={label})")
@@ -187,10 +191,13 @@ class SlidingWindowProcessor:
         
         X_windows = np.vstack(all_windows)
         y_windows = np.array(all_labels, dtype=np.int64)
+        sample_indices = np.array(all_sample_indices, dtype=np.int64)
         
         # Validation
-        self._validate_output(X_windows, y_windows, windows_per_sample, y)
+        self._validate_output(X_windows, y_windows, windows_per_sample, y, sample_indices)
         
+        if return_sample_indices:
+            return X_windows, y_windows, sample_indices
         return X_windows, y_windows
     
     def _validate_output(
@@ -198,13 +205,16 @@ class SlidingWindowProcessor:
         X_windows: np.ndarray,
         y_windows: np.ndarray,
         windows_per_sample: List[int],
-        original_y: np.ndarray
+        original_y: np.ndarray,
+        sample_indices: Optional[np.ndarray] = None
     ) -> None:
         """Validate output and log statistics."""
         # Shape checks
         assert len(X_windows.shape) == 3, f"X_windows must be 3D, got {X_windows.shape}"
         assert X_windows.shape[1] == self.window_size, f"Window size mismatch"
         assert X_windows.shape[0] == y_windows.shape[0], "Window count mismatch"
+        if sample_indices is not None:
+            assert X_windows.shape[0] == sample_indices.shape[0], "Window/sample-index count mismatch"
         
         # Check for NaN/Inf
         nan_count = np.isnan(X_windows).sum()
@@ -221,6 +231,8 @@ class SlidingWindowProcessor:
         logger.info(f"Output X shape: {X_windows.shape}")
         logger.info(f"Output y shape: {y_windows.shape}")
         logger.info(f"Windows per sample: min={min(windows_per_sample)}, max={max(windows_per_sample)}, avg={np.mean(windows_per_sample):.1f}")
+        if sample_indices is not None:
+            logger.info(f"Unique source samples contributing windows: {len(np.unique(sample_indices))}")
         
         # Class distribution
         unique_labels, counts = np.unique(y_windows, return_counts=True)

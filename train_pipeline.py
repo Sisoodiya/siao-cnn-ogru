@@ -221,9 +221,14 @@ def run_complete_pipeline(
             padding='zero'
         )
         
-        X_windows, y_windows = window_proc.transform(X_raw, y_raw)
+        X_windows, y_windows, window_group_ids = window_proc.transform(
+            X_raw, y_raw, return_sample_indices=True
+        )
     
     console.print(f" [bold]Windowed data:[/bold] X={X_windows.shape}, y={y_windows.shape}")
+    console.print(
+        f" [bold]Group IDs:[/bold] {len(np.unique(window_group_ids))} source samples for grouped CV"
+    )
     
     # =========================================================================
     # Step 3: 5-Fold Cross-Validation Setup
@@ -231,12 +236,14 @@ def run_complete_pipeline(
     console.print(Panel("[bold green]Step 3: Cross-Validation Setup[/bold green]", box=box.DOUBLE))
     
     from sklearn.model_selection import StratifiedKFold
-    from sklearn.metrics import accuracy_score, classification_report
+    from sklearn.metrics import accuracy_score
     from src.siao_cnn_ogru.visualization import plot_training_results, plot_confusion_matrix_heatmap
 
     class_counts_overall = np.bincount(y_windows, minlength=num_classes)
-    min_class_count = int(class_counts_overall[class_counts_overall > 0].min())
-    effective_folds = min(n_folds, min_class_count)
+    active_classes = np.where(class_counts_overall > 0)[0]
+    min_class_count = int(class_counts_overall[active_classes].min())
+    min_group_count_per_class = int(min(len(np.unique(window_group_ids[y_windows == cls])) for cls in active_classes))
+    effective_folds = min(n_folds, min_class_count, min_group_count_per_class)
     if effective_folds < 2:
         raise ValueError(
             f"Not enough samples for cross-validation: minimum class count is {min_class_count}. "
@@ -244,13 +251,27 @@ def run_complete_pipeline(
         )
     if effective_folds != n_folds:
         console.print(
-            f" [yellow]Requested {n_folds} folds, but smallest class has {min_class_count} samples. "
-            f"Using {effective_folds} folds instead.[/yellow]"
+            f" [yellow]Requested {n_folds} folds, but smallest class has {min_class_count} windows "
+            f"and {min_group_count_per_class} source groups. Using {effective_folds} folds instead.[/yellow]"
         )
 
-    # Initialize Stratified K-Fold
-    # Use n_folds parameter for flexibility
-    skf = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=random_seed)
+    # Initialize grouped stratified CV to prevent same-source windows appearing in both train/val
+    split_strategy = "StratifiedGroupKFold"
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+
+        splitter = StratifiedGroupKFold(n_splits=effective_folds, shuffle=True, random_state=random_seed)
+        split_iterator = splitter.split(X_windows, y_windows, groups=window_group_ids)
+    except Exception:
+        split_strategy = "StratifiedKFold (fallback)"
+        console.print(
+            " [yellow]StratifiedGroupKFold unavailable. Falling back to StratifiedKFold; "
+            "group isolation is disabled.[/yellow]"
+        )
+        splitter = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=random_seed)
+        split_iterator = splitter.split(X_windows, y_windows)
+
+    console.print(f" [bold]CV splitter:[/bold] {split_strategy}")
     
     fold_accuracies = []
     fold_macro_f1 = []
@@ -261,7 +282,7 @@ def run_complete_pipeline(
     # Step 4: Cross-Validation Loop
     # =========================================================================
     
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X_windows, y_windows)):
+    for fold, (train_idx, val_idx) in enumerate(split_iterator):
         console.print(f"\n[bold magenta]=== Fold {fold+1}/{effective_folds} ===[/bold magenta]")
         
         X_train, X_val = X_windows[train_idx], X_windows[val_idx]
@@ -502,6 +523,7 @@ def run_complete_pipeline(
         'oof_y_true': oof_true,
         'oof_y_pred': oof_pred,
         'class_codes': class_codes,
+        'cv_splitter': split_strategy,
         'class_metadata': [
             {
                 'label': idx,

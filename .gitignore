@@ -1,5 +1,6 @@
 # Keep dataset out of version control for this research workspace
 data/Operation_csv_data
+data/Operation_csv_data.zip
 
 # Runtime / experiment artifacts
 results/*
