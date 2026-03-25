@@ -150,6 +150,17 @@ class NPPADDataPipeline:
                 pad_width = 96 - features.shape[1]
                 features = np.pad(features, ((0, 0), (0, pad_width)), mode="constant")
 
+            features = features.astype(np.float32, copy=False)
+            if np.isnan(features).any() or np.isinf(features).any():
+                features = (
+                    pd.DataFrame(features)
+                    .interpolate(method="linear", axis=0, limit_direction="both")
+                    .bfill()
+                    .ffill()
+                    .values
+                )
+            features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
             all_data.append(features)
 
         combined_data = np.vstack(all_data)
@@ -177,11 +188,20 @@ class NPPADDataPipeline:
                 pad_width = 96 - features.shape[1]
                 features = np.pad(features, ((0, 0), (0, pad_width)), mode="constant")
 
-            if np.isnan(features).any():
-                features = pd.DataFrame(features).interpolate(method="linear", axis=0).bfill().ffill().values
+            features = features.astype(np.float32, copy=False)
+            if np.isnan(features).any() or np.isinf(features).any():
+                features = (
+                    pd.DataFrame(features)
+                    .interpolate(method="linear", axis=0, limit_direction="both")
+                    .bfill()
+                    .ffill()
+                    .values
+                )
+            features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
             if self.scaler is not None:
                 features = self.scaler.transform(features)
+                features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
             if self.max_timesteps is not None:
                 if len(features) > self.max_timesteps:

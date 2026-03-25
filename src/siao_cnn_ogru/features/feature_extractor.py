@@ -146,6 +146,17 @@ class StatisticalFeatureExtractor:
         logger.info(f"Extracting features from {num_windows} windows...")
         logger.info(f"Window size: {window_size}, Signals: {num_signals}")
         logger.info(f"Output features: {num_total_features}")
+
+        # Guard against upstream missing/invalid values propagating into statistics.
+        input_nan = int(np.isnan(X_windows).sum())
+        input_inf = int(np.isinf(X_windows).sum())
+        if input_nan > 0 or input_inf > 0:
+            logger.warning(
+                "Input windows contain %d NaN and %d Inf values; replacing with 0.0 before feature extraction",
+                input_nan,
+                input_inf,
+            )
+            X_windows = np.nan_to_num(X_windows, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Compute features using vectorized operations
         # Shape: [num_windows, num_signals] for each feature
@@ -163,6 +174,7 @@ class StatisticalFeatureExtractor:
         
         # 4. Variance
         var_features = np.var(X_windows, axis=1, ddof=1)
+        var_features = np.where(var_features < self.epsilon, self.epsilon, var_features)
         
         # 5. Entropy
         entropy_features = self._compute_entropy_vectorized(X_windows)
