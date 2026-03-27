@@ -13,15 +13,18 @@ Author: SIAO-CNN-OGRU Integration
 import numpy as np
 import torch
 import torch.nn as nn
+import json
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from typing import Dict, Optional, Sequence, Tuple
+from pathlib import Path
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 from src.siao_cnn_ogru.data.class_metadata import RESEARCH_CLASS_CODES_14, build_label_metadata_map
+from src.siao_cnn_ogru.reliability import analyze_reliability
 
 
 def _set_seed(seed: int) -> None:
@@ -106,8 +109,57 @@ def _adaptive_smote(
     }
 
 
+def _group_windows_to_sequences(
+    X_windows: np.ndarray,
+    y_windows: np.ndarray,
+    group_ids: np.ndarray,
+    fixed_seq_len: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Pack window-level features into sample-level sequences for ORNN.
+
+    Args:
+        X_windows: [num_windows, feat_dim]
+        y_windows: [num_windows]
+        group_ids: Source-sample id for each window [num_windows]
+        fixed_seq_len: Optional fixed sequence length for truncation/padding
+
+    Returns:
+        X_seq: [num_groups, seq_len, feat_dim]
+        y_seq: [num_groups]
+        lengths: Effective (unpadded) lengths [num_groups]
+    """
+    unique_groups, first_pos = np.unique(group_ids, return_index=True)
+    ordered_groups = unique_groups[np.argsort(first_pos)]
+    group_index_list = [np.where(group_ids == gid)[0] for gid in ordered_groups]
+
+    if not group_index_list:
+        raise ValueError("No groups available to build sequences")
+
+    seq_len = fixed_seq_len if fixed_seq_len is not None else max(len(idx) for idx in group_index_list)
+    feat_dim = X_windows.shape[1]
+
+    X_seq = np.zeros((len(group_index_list), seq_len, feat_dim), dtype=np.float32)
+    y_seq = np.zeros(len(group_index_list), dtype=np.int64)
+    lengths = np.zeros(len(group_index_list), dtype=np.int64)
+
+    for i, idx in enumerate(group_index_list):
+        group_X = X_windows[idx]
+        group_y = y_windows[idx]
+
+        # Robust label assignment in case of unexpected noise.
+        y_seq[i] = int(np.bincount(group_y).argmax())
+
+        take = min(len(idx), seq_len)
+        X_seq[i, :take, :] = group_X[:take]
+        lengths[i] = take
+
+    return X_seq, y_seq, lengths
+
+
 def run_complete_pipeline(
     data_dir: str = 'data/Operation_csv_data/',
+    max_timesteps: Optional[int] = 300,
     window_size: int = 100,
     stride: int = 25,
     cnn_embedding_dim: int = 512,  # Increased for larger feature space (97 features)
@@ -129,6 +181,9 @@ def run_complete_pipeline(
     use_class_weights: bool = True,
     label_smoothing: float = 0.05,
     use_smote: bool = True,
+    sequence_training: bool = True,
+    normal_class_code: str = "Normal",
+    time_step_hours: float = 1.0,
     balance_to_max: bool = False,
     smote_target_percentile: int = 50,
     smote_min_samples: int = 6,
@@ -186,7 +241,7 @@ def run_complete_pipeline(
     with console.status("[bold green]Ingesting NPPAD data...[/bold green]", spinner="dots"):
         pipeline = NPPADDataPipeline(
             data_dir=data_dir,
-            max_timesteps=window_size,  # Match window size
+            max_timesteps=max_timesteps,
             normalization='none',
             handle_missing='interpolate',
             active_class_codes=selected_class_codes,
@@ -293,12 +348,14 @@ def run_complete_pipeline(
         
         X_train, X_val = X_windows[train_idx], X_windows[val_idx]
         y_train, y_val = y_windows[train_idx], y_windows[val_idx]
+        groups_train = window_group_ids[train_idx]
+        groups_val = window_group_ids[val_idx]
 
         # Fold-safe normalization (prevents leakage from validation fold)
         X_train, X_val = _normalize_fold_inputs(X_train, X_val)
 
         # Optional adaptive SMOTE for supported minority classes
-        if use_smote:
+        if use_smote and not sequence_training:
             smote_percentile = 100 if balance_to_max else smote_target_percentile
             X_train, y_train, smote_info = _adaptive_smote(
                 X_train,
@@ -316,8 +373,13 @@ def run_complete_pipeline(
                 console.print(
                     f" [green]SMOTE skipped: {smote_info['reason']}[/green]"
                 )
+        elif use_smote and sequence_training:
+            console.print(
+                " [yellow]SMOTE requested but skipped in sequence_training mode "
+                "(synthetic windows do not have valid source-group ids).[/yellow]"
+            )
 
-        console.print(f" [bold]Train:[/bold] {len(y_train)} samples, [bold]Val:[/bold] {len(y_val)} samples")
+        console.print(f" [bold]Train windows:[/bold] {len(y_train)}, [bold]Val windows:[/bold] {len(y_val)}")
 
         # Convert to tensors
         X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
@@ -435,11 +497,30 @@ def run_complete_pipeline(
             patience=20
         )
         
+        if sequence_training:
+            X_train_rnn_np, y_train_target, train_lengths = _group_windows_to_sequences(
+                X_train_combined, y_train, groups_train
+            )
+            X_val_rnn_np, y_val_target, val_lengths = _group_windows_to_sequences(
+                X_val_combined, y_val, groups_val, fixed_seq_len=X_train_rnn_np.shape[1]
+            )
+            console.print(
+                f" [bold]Train sequences:[/bold] {len(y_train_target)} (max_len={X_train_rnn_np.shape[1]}, "
+                f"avg_len={float(train_lengths.mean()):.2f}) | "
+                f"[bold]Val sequences:[/bold] {len(y_val_target)} (avg_len={float(val_lengths.mean()):.2f})"
+            )
+        else:
+            # Legacy mode: ORNN sees a single feature vector as sequence length 1.
+            X_train_rnn_np = np.expand_dims(X_train_combined, axis=1).astype(np.float32)
+            X_val_rnn_np = np.expand_dims(X_val_combined, axis=1).astype(np.float32)
+            y_train_target = y_train
+            y_val_target = y_val
+
         # Class Weights
         if use_class_weights:
-            class_counts = np.bincount(y_train, minlength=num_classes)
+            class_counts = np.bincount(y_train_target, minlength=num_classes)
             # Add 1 to avoid division by zero if a class is missing in a fold (unlikely with StratifiedKFold)
-            weights = len(y_train) / (num_classes * (class_counts + 1))
+            weights = len(y_train_target) / (num_classes * (class_counts + 1))
             weights_t = torch.tensor(weights, dtype=torch.float32).to(device)
             trainer.criterion = nn.CrossEntropyLoss(
                 weight=weights_t,
@@ -448,15 +529,6 @@ def run_complete_pipeline(
         else:
             trainer.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
             
-        # Prepare Data for RNN (Numpy format for trainer.train)
-        # Ensure 3D shape: [samples, 1, features]
-        if X_train_combined.ndim == 2:
-            X_train_rnn_np = np.expand_dims(X_train_combined, axis=1)
-            X_val_rnn_np = np.expand_dims(X_val_combined, axis=1)
-        else:
-            X_train_rnn_np = X_train_combined
-            X_val_rnn_np = X_val_combined
-            
         # Used for evaluation later
         X_train_rnn = torch.tensor(X_train_rnn_np, dtype=torch.float32).to(device)
         X_val_rnn = torch.tensor(X_val_rnn_np, dtype=torch.float32).to(device)
@@ -464,8 +536,8 @@ def run_complete_pipeline(
         # Train - Pass numpy arrays as expected by SIAOORNNTrainer
         # It handles tensor conversion and dataloader creation internally
         result_dict = trainer.train(
-            X_train_rnn_np, y_train,
-            X_val_rnn_np, y_val,
+            X_train_rnn_np, y_train_target,
+            X_val_rnn_np, y_val_target,
             batch_size=batch_size
         )
         history = result_dict['backprop']
@@ -486,18 +558,18 @@ def run_complete_pipeline(
             y_pred_np = preds.cpu().numpy()
 
             plot_confusion_matrix_heatmap(
-                y_val, y_pred_np, 
+                y_val_target, y_pred_np, 
                 classes=class_codes,
                 fold_idx=fold,
                 save_dir='results/plots'
             )
             
-            fold_acc = accuracy_score(y_val, y_pred_np)
+            fold_acc = accuracy_score(y_val_target, y_pred_np)
             fold_accuracies.append(fold_acc)
             from sklearn.metrics import f1_score
-            fold_f1 = f1_score(y_val, y_pred_np, average='macro')
+            fold_f1 = f1_score(y_val_target, y_pred_np, average='macro')
             fold_macro_f1.append(fold_f1)
-            oof_y_true.append(y_val.copy())
+            oof_y_true.append(y_val_target.copy())
             oof_y_pred.append(y_pred_np.copy())
             
         console.print(
@@ -520,6 +592,18 @@ def run_complete_pipeline(
     oof_true = np.concatenate(oof_y_true) if oof_y_true else np.array([], dtype=np.int64)
     oof_pred = np.concatenate(oof_y_pred) if oof_y_pred else np.array([], dtype=np.int64)
 
+    reliability_report = analyze_reliability(
+        y_true=oof_true,
+        y_pred=oof_pred,
+        class_codes=class_codes,
+        normal_class_code=normal_class_code,
+        time_step_hours=time_step_hours,
+    )
+
+    reliability_save_path = Path(save_dir) / "reliability_summary_ogru.json"
+    reliability_save_path.parent.mkdir(parents=True, exist_ok=True)
+    reliability_save_path.write_text(json.dumps(reliability_report, indent=2))
+
     return {
         'avg_accuracy': avg_acc,
         'fold_accuracies': fold_accuracies,
@@ -530,6 +614,8 @@ def run_complete_pipeline(
         'oof_y_pred': oof_pred,
         'class_codes': class_codes,
         'cv_splitter': split_strategy,
+        'reliability': reliability_report,
+        'reliability_summary_path': str(reliability_save_path),
         'class_metadata': [
             {
                 'label': idx,
@@ -556,6 +642,7 @@ def quick_start():
     """
     return run_complete_pipeline(
         data_dir='data/Operation_csv_data/',
+        max_timesteps=300,
         window_size=100,
         stride=25,
         cnn_embedding_dim=256,  # Optuna best; better bias-variance balance for subset runs
@@ -572,7 +659,9 @@ def quick_start():
         bp_lr=0.00157,  # Optuna optimized
         fc_dropout=0.164,  # Optuna optimized
         weight_decay=1.97e-05,  # Optuna optimized
-        batch_size=163
+        batch_size=163,
+        use_smote=False,
+        sequence_training=True,
     )
 
 
@@ -609,6 +698,7 @@ if __name__ == '__main__':
     # Pass command-line arguments to the training function
     results = run_complete_pipeline(
         data_dir='data/Operation_csv_data/',
+        max_timesteps=300,
         window_size=100,
         stride=25,
         cnn_embedding_dim=512,
@@ -620,7 +710,7 @@ if __name__ == '__main__':
         bp_epochs=args.epochs,  # Use command-line argument
         siao_pop_size=50,   # Phase 1: increased 30->50 for benchmarking
         siao_max_iter=100,  # Phase 1: was 40
+        use_smote=False,
+        sequence_training=True,
         save_dir='results/'
     )
-
-
