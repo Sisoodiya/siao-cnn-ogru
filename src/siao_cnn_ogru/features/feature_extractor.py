@@ -78,32 +78,42 @@ class StatisticalFeatureExtractor:
         """
         num_windows = signal.shape[0]
         entropies = np.zeros(num_windows, dtype=np.float32)
-        
+
         for i in range(num_windows):
-            window_signal = signal[i]
-            
+            # Keep entropy robust even if upstream sends non-finite values.
+            window_signal = np.nan_to_num(
+                signal[i],
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
             # Handle constant signals
-            if np.std(window_signal) < self.epsilon:
+            if np.std(window_signal) < self.epsilon or np.ptp(window_signal) < self.epsilon:
                 entropies[i] = 0.0
                 continue
-            
-            # Create histogram
-            hist, _ = np.histogram(window_signal, bins=self.entropy_bins, density=True)
-            
-            # Normalize to probability distribution
-            hist = hist + self.epsilon  # Avoid log(0)
-            hist = hist / hist.sum()
-            
-            # Compute entropy
-            entropy = -np.sum(hist * np.log2(hist))
-            
+
+            # Use raw counts (not density=True) to avoid NaN/Inf in edge cases.
+            hist, _ = np.histogram(window_signal, bins=self.entropy_bins, density=False)
+            total = hist.sum()
+            if total <= 0:
+                entropies[i] = 0.0
+                continue
+
+            probs = hist.astype(np.float64) / float(total)
+            probs = probs[probs > 0]
+            entropy = -np.sum(probs * np.log2(probs))
+
             # Normalize to [0, 1] if requested
             if self.normalize_entropy:
                 max_entropy = np.log2(self.entropy_bins)
                 entropy = entropy / max_entropy if max_entropy > 0 else 0.0
-            
-            entropies[i] = entropy
-        
+
+            if not np.isfinite(entropy):
+                entropy = 0.0
+
+            entropies[i] = float(entropy)
+
         return entropies
     
     def _compute_entropy_vectorized(self, X: np.ndarray) -> np.ndarray:
@@ -160,20 +170,21 @@ class StatisticalFeatureExtractor:
         
         # Compute features using vectorized operations
         # Shape: [num_windows, num_signals] for each feature
-        
+        X_stats = X_windows.astype(np.float64, copy=False)
+
         # 1. Mean (axis=1 is the time dimension)
-        mean_features = np.mean(X_windows, axis=1)
-        
+        mean_features = np.mean(X_stats, axis=1)
+
         # 2. Median
-        median_features = np.median(X_windows, axis=1)
-        
+        median_features = np.median(X_stats, axis=1)
+
         # 3. Standard Deviation (with ddof=1 for sample std)
-        std_features = np.std(X_windows, axis=1, ddof=1)
+        std_features = np.std(X_stats, axis=1, ddof=1)
         # Handle edge case where std is 0
         std_features = np.where(std_features < self.epsilon, self.epsilon, std_features)
-        
+
         # 4. Variance
-        var_features = np.var(X_windows, axis=1, ddof=1)
+        var_features = np.var(X_stats, axis=1, ddof=1)
         var_features = np.where(var_features < self.epsilon, self.epsilon, var_features)
         
         # 5. Entropy
@@ -194,6 +205,7 @@ class StatisticalFeatureExtractor:
             ])
         
         features = np.hstack(features_list)
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Validate output
         self._validate_output(features, num_windows, num_signals)
